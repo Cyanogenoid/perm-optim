@@ -8,9 +8,12 @@ import torchvision.datasets as datasets
 import scipy.optimize
 import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
 
 import data
 import track
+import permutation
 from model import MosaicNet, PermNet, ClassifyNet
 
 
@@ -33,6 +36,7 @@ parser.add_argument('--train-only', action='store_true', help='Only run training
 parser.add_argument('--eval-only', action='store_true', help='Only run evaluation, no training')
 parser.add_argument('--input-sorted', action='store_true', help='Input the correctly sorted sequence instead of random order')
 parser.add_argument('--multi-gpu', action='store_true', help='Use multiple GPUs')
+parser.add_argument('--vis', type=int, default=0, help='Visualisation mode.')
 # sort
 sort_parser = subparser.add_parser('sort')
 sort_parser.add_argument('--length', type=int, default=10, help='How many numbers to sort')
@@ -150,7 +154,7 @@ if args.resume:
     strict = True
     if args.multi_gpu:
         n = n.module
-    if args.task == 'classify':
+    if args.task == 'classify' and not args.vis:
         # we only want to load the classifier portion of the model, not the
         # mosaic portion because it changes with different tile size
         weights = {k: v for k, v in weights.items() if k.startswith('model')}
@@ -178,7 +182,22 @@ def apply_hard_assignment(x, idx):
     permuted = [sample[:, torch.from_numpy(i)] for sample, i in zip(x, idx)]
     return torch.stack(permuted)
 
+current_vis = None
+if args.vis:
+    def vis_hook(module, input, output):
+        global current_vis
+        current_vis = output.detach()
+    vis = []
+    n = net
+    if args.task == 'classify':
+        n = n.mosaic
+    if args.task == 'sort' and args.vis == 2:
+        n.compare.skew.register_forward_hook(vis_hook)
+    else:
+        n.compare.register_forward_hook(vis_hook)
+
 def run(net, loader, optimizer, train=False, epoch=0):
+    global current_vis
     if train:
         net.train()
         prefix = 'train'
@@ -198,6 +217,10 @@ def run(net, loader, optimizer, train=False, epoch=0):
         if not train and not args.no_hard_assign:
             acc, hard_assignments = permutation_acc(assignment, idx)
             reconstruction = apply_hard_assignment(x, hard_assignments)
+
+            if args.vis:
+                vis_data = [x, current_vis]
+                vis.append([each.detach().cpu() for each in vis_data])
         else:
             acc = 0
 
@@ -232,6 +255,9 @@ def run(net, loader, optimizer, train=False, epoch=0):
             lr=tracked_lr,
         )
 
+        if args.vis:
+            return
+
 
 import subprocess
 git_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD'])
@@ -255,3 +281,182 @@ for epoch in range(args.epochs):
     torch.save(results, os.path.join('logs', args.name))
     if args.eval_only:
         break
+
+
+if args.vis:
+    if args.task == 'sort':  # sort plots
+        plt.rcParams['xtick.bottom'] = plt.rcParams['xtick.labelbottom'] = False
+        plt.rcParams['xtick.top'] = plt.rcParams['xtick.labeltop'] = True
+        resolution = 1000j
+        grid_x, grid_y = np.mgrid[args.low:args.high:resolution, args.low:args.high:resolution]
+        for sample in vis[:1]:
+            numbers, evals = sample
+            numbers = numbers.squeeze(1)
+            evals = evals.squeeze(1)
+            # meshgrid
+            X, Y = permutation.outer(numbers)
+            X = X.contiguous().view(-1)
+            Y = Y.contiguous().view(-1)
+            coords = torch.stack([Y, X], dim=1)
+            values = evals.view(-1)
+            if args.vis == 1:
+                # not sure where the plotting is transposing things
+                values *= -1
+            Z = griddata(coords, values, (grid_x, grid_y), method='linear')
+            img = plt.imshow(Z, cmap='coolwarm', extent=[args.low, args.high, args.low, args.high], origin='lower')
+            plt.colorbar(img)
+            plt.gca().invert_yaxis()
+            if args.vis == 1:
+                plt.savefig('F.pdf', bbox_inches='tight')
+            else:
+                plt.savefig('f.pdf', bbox_inches='tight')
+    elif args.vis == 2:  # pairwise F evals, sorted
+        if args.task == 'classify':
+            net = net.mosaic
+        for sample in vis[:1]:  # over batches imgs, evals = sample  # only first element of batch
+            imgs, evals = sample  # only first element of batch
+            imgs = imgs[0][0]  # s, w, h
+            evals = evals[0]  # s, s
+            for i, (name, ev) in enumerate(zip(['rows', 'cols'], evals), start=1):
+                sums, ordering = ev.sum(1).sort()
+                ev = ev[ordering, :][:, ordering]
+                ordered_imgs = imgs[ordering]
+
+                plt.figure()
+                for j, img in enumerate(ordered_imgs, start=1):
+                    plt.subplot(1, imgs.size(0), j)
+                    plt.imshow(img.numpy(), cmap='gray')
+                    plt.xticks([], [])
+                    plt.yticks([], [])
+                plt.savefig(f'cost-{name}-rlabel.pdf', bbox_inches='tight')
+
+                for j, img in enumerate(ordered_imgs, start=1):
+                    plt.subplot(imgs.size(0), 1, j)
+                    plt.imshow(img.numpy(), cmap='gray')
+                    plt.xticks([], [])
+                    plt.yticks([], [])
+                plt.savefig(f'cost-{name}-clabel.pdf', bbox_inches='tight',)
+
+                plt.subplot(4, 1, i*2)
+                plt.figure()
+                p = plt.imshow(ev.numpy(), cmap='coolwarm')#, vmin=-5, vmax=5)
+                plt.colorbar(p)
+                plt.xticks([], [])
+                plt.yticks([], [])
+                plt.savefig(f'cost-{name}.pdf', bbox_inches='tight')
+    elif args.vis == 3:  # average sensitivity to spatial location
+        if args.task == 'classify':
+            net = net.mosaic
+        for sample in vis[:1]:  # over batches
+            net.train()
+            imgs, _ = sample  # only first element of batch
+            # imgs :: n, s, w, h
+            # forward pass of mosaic net
+            x_in = imgs.cuda()
+            x_in.requires_grad = True
+            x = x_in
+            x = net.conv_stack(x)
+            x = x.permute(0, 1, 3, 4, 2).contiguous()  # put sequence dim last
+            x = x.view(x.size(0), -1, x.size(-1))
+            if False:
+                a, b = permutation.outer(x)
+                x = torch.cat([a, b], dim=1)
+                c = net.compare.skew(x)
+            else:
+                c = net.compare(x)
+            c = c.cpu()
+            # n c s s
+            c = c.transpose(0, 1)  # swap batch dim with cost dim
+            x_grads = []
+            for cost in c:
+                grad = torch.autograd.grad(cost.abs().mean(0).sum(), x_in, retain_graph=True)[0]
+#                grad = torch.autograd.grad(cost.abs()[0].sum(), x_in, retain_graph=True)[0]
+                print(grad.size())
+                x_grads.append(grad)
+
+#            plt.figure(figsize=(8, 2.5))
+            for i, grad in enumerate(x_grads):
+                # 32, 1, 4, 14, 14
+                global_grads = grad.abs().sum(0).mean(0).mean(0)  # only keep spatial dims
+                plt.subplot(1, 2, i+1)
+                p = plt.imshow(global_grads.cpu().detach().numpy(), cmap='magma')
+                plt.xticks([], [])
+                plt.yticks([], [])
+            plt.savefig(f'sensitivity-{args.dataset}-{args.tiles_per_side}.pdf', bbox_inches='tight')
+    elif args.vis == 4:  # gradients on pairs of tiles
+        if args.task == 'classify':
+            net = net.mosaic
+        for sample in vis[:1]:  # over batches
+            net.train()
+            imgs, _ = sample  # only first element of batch
+            # imgs :: n, c, s, w, h
+            # forward pass of mosaic net
+            x_in = imgs.cuda()
+            x_in.requires_grad = True
+            x = x_in
+            x = net.conv_stack(x)
+            x = x.permute(0, 1, 3, 4, 2).contiguous()  # put sequence dim last
+            x = x.view(x.size(0), -1, x.size(-1))
+            if False:
+                a, b = permutation.outer(x)
+                x = torch.cat([a, b], dim=1)
+                c = net.compare.skew(x)
+            else:
+                c = net.compare(x)
+            c = c.cpu()
+            c = c.transpose(0, 1)  # swap batch dim with cost dim
+            # n c s s
+            x_grads = []
+            for cost in c:
+#                avg_grad = torch.autograd.grad(cost.abs().sum(0).mean(), x_in, retain_graph=True)[0]
+                data = []
+                cost = cost[0] # only first element of batch
+                xin = x_in
+                for i in range(len(cost)):
+                    for j in range(len(cost)):
+                        if j <= i:
+                            continue
+                        grad = torch.autograd.grad(cost[i, j], xin, retain_graph=True)[0]
+#                        grad = grad.abs() - avg_grad.abs()
+                        if args.dataset == 'mnist':
+                            inputs = xin[0, 0, i], xin[0, 0, j]
+                        else:
+                            inputs = xin[0, :, i], xin[0, :, j]
+                        grads = grad.mean(1)[0, i], grad.mean(1)[0, j]
+                        data.append(inputs + grads)
+                x_grads.append(data)
+
+            for k, t in enumerate(x_grads):
+                t = t[:10]
+                suffix = 'rows' if k == 0 else 'cols'
+                plt.figure(figsize=(4, 8))
+                for i, data in enumerate(t):
+                    # 32, 1, 4, 14, 14
+                    for j, thing in enumerate(data):
+                        plt.subplot(len(t), 4, i*4 + j + 1)
+                        if j < 2:
+                            if args.dataset == 'mnist':
+                                plt.imshow(thing.detach().cpu().numpy(), cmap='gray', vmin=x_in.min(), vmax=x_in.max())
+                            else:
+                                stats = x_in.permute(1, 0, 2, 3, 4).contiguous().view(3, -1)
+                                mi, ma = stats.min(1)[0], stats.max(1)[0]
+                                thing = thing.permute(1, 2, 0)
+                                thing = (thing - mi) / (ma - mi)
+                                plt.imshow(thing.detach().cpu().numpy())
+                        else:
+                            if j == 3:
+                                thing = -thing
+                            plt.imshow(thing.detach().cpu().numpy(), cmap='coolwarm', vmin=-2, vmax=2)
+                        plt.xticks([], [])
+                        plt.yticks([], [])
+                plt.savefig(f'gradients-{args.dataset}-{args.tiles_per_side}-{suffix}.pdf', bbox_inches='tight')
+    elif args.vis == 5:  # tiles, in a column
+        sample = vis[0]
+        imgs, _ = sample  # only first element of batch
+        imgs = imgs[0][0]
+        for i, tile in enumerate(imgs):
+            plt.subplot(imgs.size(0), 1, i+1)
+            plt.imshow(tile.detach().cpu().numpy(), cmap='gray', vmin=imgs.min(), vmax=imgs.max())
+            plt.xticks([], [])
+            plt.yticks([], [])
+        plt.savefig(f'example-{args.dataset}-{args.tiles_per_side}.pdf', bbox_inches='tight')
