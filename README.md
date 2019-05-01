@@ -1,6 +1,6 @@
 # Learning Representations of Sets through Optimized Permutations
 
-![Example reconstructions on MNIST](mnist.png)
+![Sketch of model architecture](sketch.png)
 
 [[poster]][3]
 
