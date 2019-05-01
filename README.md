@@ -10,9 +10,17 @@ This avoids the bottleneck where a set of arbitrary size is pooled into a featur
 
 The main algorithm is contained in [`permutation.py`][1].
 Experiments can be run through the scripts in the `experiments` folder, which calls `train.py` with the appropriate arguments.
-The VQA experiment is located in the `ban-vqa` folder, which is a fork of the [ban-vqa][2] source code.
+The VQA experiment is located in the `ban-vqa` folder, which is a fork of the [ban-vqa][2] source code with an additional`permnet.py` and `permutation.py`.
 
-# BibTeX entry
+## Commands
+From the root directory, you can run:
+- the sorting experiment: `experiments/sort.sh`
+- the mosaic experiments: `experiments/mosaic.sh {mnist,cifar10}`, `experiments/mosaic-imagenet.sh`, `experiments/classify.sh {mnist,cifar10}`, `experiments/classify-imagenet.sh`
+- reconstruct mosaics: `experiments/reconstruct-images.sh`
+
+You can create the visualisations in the appendix by resuming from a trained model with various `--vis {0,1,2,3,4,5}` arguments to `train.py`, see the comments in the training script for more details.
+
+## BibTeX entry
 ```
 @inproceedings{
 	zhang2018permoptim,
