@@ -207,7 +207,7 @@ def run(net, loader, optimizer, train=False, epoch=0):
 
     loader = tqdm(loader, ncols=0, desc='{1} E{0:02d}'.format(epoch, 'train' if train else 'test '))
     for sample in loader:
-        x, sorted_x, idx, label = map(lambda x: x.cuda(async=True), sample)
+        x, sorted_x, idx, label = map(lambda x: x.cuda(), sample)
 
         if args.input_sorted:
             x = sorted_x
