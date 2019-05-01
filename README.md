@@ -23,7 +23,7 @@ You can create the visualisations in the appendix by resuming from a trained mod
 ## BibTeX entry
 ```
 @inproceedings{
-	zhang2018permoptim,
+	zhang2019permoptim,
 	title={Learning Representations of Sets through Optimized Permutations},
 	author={Yan Zhang and Jonathon Hare and Adam Prügel-Bennett},
 	booktitle={International Conference on Learning Representations},
